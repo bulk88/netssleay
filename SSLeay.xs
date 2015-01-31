@@ -118,7 +118,7 @@
  *
  * Runtime debugging:
  *
- * with TRACE(level,fmt,...) you can output debug messages.
+ * with TRACE(aTHX_ level,fmt,...) you can output debug messages.
  * it behaves the same as
  *   warn sprintf($msg,...) if $Net::SSLeay::trace>=$level
  * would do in Perl (e.g. it is using also the $Net::SSLeay::trace variable)
@@ -133,6 +133,10 @@
 
 /* Prevent warnings about strncpy from Windows compilers */
 #define _CRT_SECURE_NO_DEPRECATE
+#define PERL_NO_GET_CONTEXT
+#ifdef WIN32
+#  define NO_XSLOCKS
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -208,7 +212,7 @@ which conflicts with perls
 #define PR4(s,t,u,v)
 #endif
 
-static void TRACE(int level,char *msg,...) {
+static void TRACE(pTHX_ int level,char *msg,...) {
     va_list args;
     SV *trace = get_sv("Net::SSLeay::trace",0);
     if (trace && SvIOK(trace) && SvIV(trace)>=level) {
@@ -237,7 +241,7 @@ static perl_mutex *GLOBAL_openssl_mutex = NULL;
 #endif
 static int LIB_initialized;
 
-UV get_my_thread_id(void) /* returns threads->tid() value */
+UV get_my_thread_id(pTHX) /* returns threads->tid() value */
 {
     dSP;
     UV tid = 0;
@@ -287,12 +291,14 @@ static void openssl_locking_function(int mode, int type, const char *file, int l
 #if OPENSSL_VERSION_NUMBER < 0x10000000L
 static unsigned long openssl_threadid_func(void)
 {
+    dTHX;
     dMY_CXT;
     return (unsigned long)(MY_CXT.tid);
 }
 #else
 void openssl_threadid_func(CRYPTO_THREADID *id)
 {
+    dTHX;
     dMY_CXT;
     CRYPTO_THREADID_set_numeric(id, (unsigned long)(MY_CXT.tid));
 }
@@ -393,7 +399,10 @@ static void handler_list_md_fn(const EVP_MD *m, const char *from, const char *to
   if (strcmp(from, mname)) return;                          /* Skip shortnames */
   if (EVP_MD_flags(m) & EVP_MD_FLAG_PKEY_DIGEST) return;    /* Skip clones */
   if (strchr(mname, ' ')) mname= EVP_MD_name(m);
-  av_push(arg, newSVpv(mname,0));
+  {
+    dTHX;
+    av_push(arg, newSVpv(mname,0));
+  }
 }
 #endif
 
@@ -439,40 +448,46 @@ static void handler_list_md_fn(const EVP_MD *m, const char *from, const char *to
 /* ============= callback stuff - generic functions============== */
 
 struct _ssleay_cb_t {
+#ifdef PERL_IMPLICIT_CONTEXT
+    tTHX my_perl;
+#endif
     SV* func;
     SV* data;
 };
 typedef struct _ssleay_cb_t simple_cb_data_t;
 
-simple_cb_data_t* simple_cb_data_new(SV* func, SV* data)
+#ifdef PERL_IMPLICIT_CONTEXT
+#  define dSSLTHX pTHX = cb->aTHX
+#else
+#  define dSSLTHX dNOOP
+#endif
+
+simple_cb_data_t* simple_cb_data_new(pTHX_ SV* func, SV* data)
 {
     simple_cb_data_t* cb;
     New(0, cb, 1, simple_cb_data_t);
     if (cb) {
         SvREFCNT_inc(func);
         SvREFCNT_inc(data);
+#ifdef PERL_IMPLICIT_CONTEXT
+        cb->aTHX = aTHX;
+#endif
         cb->func = func;
         cb->data = (data == &PL_sv_undef) ? NULL : data;
     }
     return cb;
 }
 
-void simple_cb_data_free(simple_cb_data_t* cb)
+void simple_cb_data_free(pTHX_ simple_cb_data_t* cb)
 {
     if (cb) {
-        if (cb->func) {
-            SvREFCNT_dec(cb->func);
-            cb->func = NULL;
-        }
-        if (cb->data) {
-            SvREFCNT_dec(cb->data);
-            cb->data = NULL;
-        }
+        SvREFCNT_dec(cb->func);
+        SvREFCNT_dec(cb->data);
+        Safefree(cb);
     }
-    Safefree(cb);
 }
 
-int cb_data_advanced_put(void *ptr, const char* data_name, SV* data)
+int cb_data_advanced_put(pTHX_ void *ptr, const char* data_name, SV* data)
 {
     HV * L2HV;
     SV ** svtmp;
@@ -507,7 +522,7 @@ int cb_data_advanced_put(void *ptr, const char* data_name, SV* data)
     return 1;
 }
 
-SV* cb_data_advanced_get(void *ptr, const char* data_name)
+SV* cb_data_advanced_get(pTHX_ void *ptr, const char* data_name)
 {
     HV * L2HV;
     SV ** svtmp;
@@ -537,7 +552,7 @@ SV* cb_data_advanced_get(void *ptr, const char* data_name)
     return *svtmp;
 }
 
-int cb_data_advanced_drop(void *ptr)
+int cb_data_advanced_drop(pTHX_ void *ptr)
 {
     int len;
     char key_name[500];
@@ -554,6 +569,7 @@ int cb_data_advanced_drop(void *ptr)
 
 static int ssleay_verify_callback_invoke (int ok, X509_STORE_CTX* x509_store)
 {
+    dTHX;
     dSP;
     SSL* ssl;
     int count = -1, res;
@@ -561,11 +577,11 @@ static int ssleay_verify_callback_invoke (int ok, X509_STORE_CTX* x509_store)
 
     PR1("STARTED: ssleay_verify_callback_invoke\n");
     ssl = X509_STORE_CTX_get_ex_data(x509_store, SSL_get_ex_data_X509_STORE_CTX_idx());
-    cb_func = cb_data_advanced_get(ssl, "ssleay_verify_callback!!func");
+    cb_func = cb_data_advanced_get(aTHX_ ssl, "ssleay_verify_callback!!func");
     
     if (!SvOK(cb_func)) {
         SSL_CTX* ssl_ctx = SSL_get_SSL_CTX(ssl);
-        cb_func = cb_data_advanced_get(ssl_ctx, "ssleay_verify_callback!!func");
+        cb_func = cb_data_advanced_get(aTHX_ ssl_ctx, "ssleay_verify_callback!!func");
      }
  
     if (!SvOK(cb_func))
@@ -602,14 +618,15 @@ static int ssleay_verify_callback_invoke (int ok, X509_STORE_CTX* x509_store)
 
 static int ssleay_ctx_passwd_cb_invoke(char *buf, int size, int rwflag, void *userdata)
 {
+    dTHX;
     dSP;
     int count = -1;
     char *res;
     SV *cb_func, *cb_data;
 
     PR1("STARTED: ssleay_ctx_passwd_cb_invoke\n");
-    cb_func = cb_data_advanced_get(userdata, "ssleay_ctx_passwd_cb!!func");
-    cb_data = cb_data_advanced_get(userdata, "ssleay_ctx_passwd_cb!!data");
+    cb_func = cb_data_advanced_get(aTHX_ userdata, "ssleay_ctx_passwd_cb!!func");
+    cb_data = cb_data_advanced_get(aTHX_ userdata, "ssleay_ctx_passwd_cb!!data");
 
     if(!SvOK(cb_func))
         croak ("Net::SSLeay: ssleay_ctx_passwd_cb_invoke called, but not set to point to any perl function.\n");
@@ -647,6 +664,7 @@ static int ssleay_ctx_passwd_cb_invoke(char *buf, int size, int rwflag, void *us
 
 int ssleay_ctx_cert_verify_cb_invoke(X509_STORE_CTX* x509_store_ctx, void* data)
 {
+    dTHX;
     dSP;
     int count = -1;
     int res;
@@ -663,8 +681,8 @@ int ssleay_ctx_cert_verify_cb_invoke(X509_STORE_CTX* x509_store_ctx, void* data)
     ptr = (void*) data;
 #endif
 
-    cb_func = cb_data_advanced_get(ptr, "ssleay_ctx_cert_verify_cb!!func");
-    cb_data = cb_data_advanced_get(ptr, "ssleay_ctx_cert_verify_cb!!data");
+    cb_func = cb_data_advanced_get(aTHX_ ptr, "ssleay_ctx_cert_verify_cb!!func");
+    cb_data = cb_data_advanced_get(aTHX_ ptr, "ssleay_ctx_cert_verify_cb!!data");
 
     if(!SvOK(cb_func))
         croak ("Net::SSLeay: ssleay_ctx_cert_verify_cb_invoke called, but not set to point to any perl function.\n");
@@ -697,6 +715,7 @@ int ssleay_ctx_cert_verify_cb_invoke(X509_STORE_CTX* x509_store_ctx, void* data)
 
 int tlsext_servername_callback_invoke(SSL *ssl, int *ad, void *arg)
 {
+    dTHX;
     dSP;
     int count = -1;
     int res;
@@ -704,8 +723,8 @@ int tlsext_servername_callback_invoke(SSL *ssl, int *ad, void *arg)
 
     PR1("STARTED: tlsext_servername_callback_invoke\n");
 
-    cb_func = cb_data_advanced_get(arg, "tlsext_servername_callback!!func");
-    cb_data = cb_data_advanced_get(arg, "tlsext_servername_callback!!data");
+    cb_func = cb_data_advanced_get(aTHX_ arg, "tlsext_servername_callback!!func");
+    cb_data = cb_data_advanced_get(aTHX_ arg, "tlsext_servername_callback!!data");
 
     if(!SvOK(cb_func))
         croak ("Net::SSLeay: tlsext_servername_callback_invoke called, but not set to point to any perl function.\n");
@@ -740,6 +759,7 @@ int tlsext_servername_callback_invoke(SSL *ssl, int *ad, void *arg)
 
 int tlsext_status_cb_invoke(SSL *ssl, void *arg)
 {
+    dTHX;
     dSP;
     SV *cb_func, *cb_data;
     SSL_CTX *ctx = SSL_get_SSL_CTX(ssl);
@@ -747,8 +767,8 @@ int tlsext_status_cb_invoke(SSL *ssl, void *arg)
     const unsigned char *p = NULL;
     OCSP_RESPONSE *ocsp_response = NULL;
 
-    cb_func = cb_data_advanced_get(ctx, "tlsext_status_cb!!func");
-    cb_data = cb_data_advanced_get(ctx, "tlsext_status_cb!!data");
+    cb_func = cb_data_advanced_get(aTHX_ ctx, "tlsext_status_cb!!func");
+    cb_data = cb_data_advanced_get(aTHX_ ctx, "tlsext_status_cb!!data");
 
     if ( ! SvROK(cb_func) || (SvTYPE(SvRV(cb_func)) != SVt_PVCV))
 	croak ("Net::SSLeay: tlsext_status_cb_invoke called, but not set to point to any perl function.\n");
@@ -790,6 +810,7 @@ int ssleay_session_secret_cb_invoke(SSL* s, void* secret, int *secret_len,
                                     STACK_OF(SSL_CIPHER) *peer_ciphers,
                                     SSL_CIPHER **cipher, void *arg)
 {
+    dTHX;
     dSP;
     int count = -1, res, i;
     AV *ciphers = newAV();
@@ -797,8 +818,8 @@ int ssleay_session_secret_cb_invoke(SSL* s, void* secret, int *secret_len,
     SV * cb_func, *cb_data;
 
     PR1("STARTED: ssleay_session_secret_cb_invoke\n");
-    cb_func = cb_data_advanced_get(arg, "ssleay_session_secret_cb!!func");
-    cb_data = cb_data_advanced_get(arg, "ssleay_session_secret_cb!!data");
+    cb_func = cb_data_advanced_get(aTHX_ arg, "ssleay_session_secret_cb!!func");
+    cb_data = cb_data_advanced_get(aTHX_ arg, "ssleay_session_secret_cb!!data");
 
     if(!SvOK(cb_func))
         croak ("Net::SSLeay: ssleay_ctx_passwd_cb_invoke called, but not set to point to any perl function.\n");
@@ -844,7 +865,7 @@ int ssleay_session_secret_cb_invoke(SSL* s, void* secret, int *secret_len,
 
 #if OPENSSL_VERSION_NUMBER >= 0x10001000L && !defined(OPENSSL_NO_NEXTPROTONEG)
 
-int next_proto_helper_AV2protodata(AV * list, unsigned char *out)
+int next_proto_helper_AV2protodata(pTHX_ AV * list, unsigned char *out)
 {
     int i, last_index, ptr = 0;
     last_index = av_len(list);
@@ -863,7 +884,7 @@ int next_proto_helper_AV2protodata(AV * list, unsigned char *out)
     return ptr;
 }
 
-int next_proto_helper_protodata2AV(AV * list, const unsigned char *in, unsigned int inlen)
+int next_proto_helper_protodata2AV(pTHX_ AV * list, const unsigned char *in, unsigned int inlen)
 {
     unsigned int i = 0;
     unsigned char il;
@@ -880,6 +901,7 @@ int next_proto_helper_protodata2AV(AV * list, const unsigned char *in, unsigned 
 int next_proto_select_cb_invoke(SSL *ssl, unsigned char **out, unsigned char *outlen,
                                 const unsigned char *in, unsigned int inlen, void *arg)
 {
+    dTHX;
     SV *cb_func, *cb_data;
     unsigned char *next_proto_data;
     size_t next_proto_len;
@@ -889,11 +911,11 @@ int next_proto_select_cb_invoke(SSL *ssl, unsigned char **out, unsigned char *ou
     STRLEN n_a;
 
     PR1("STARTED: next_proto_select_cb_invoke\n");
-    cb_func = cb_data_advanced_get(ctx, "next_proto_select_cb!!func");
-    cb_data = cb_data_advanced_get(ctx, "next_proto_select_cb!!data");
+    cb_func = cb_data_advanced_get(aTHX_ ctx, "next_proto_select_cb!!func");
+    cb_data = cb_data_advanced_get(aTHX_ ctx, "next_proto_select_cb!!data");
     /* clear last_status value = store undef */
-    cb_data_advanced_put(ssl, "next_proto_select_cb!!last_status", NULL);
-    cb_data_advanced_put(ssl, "next_proto_select_cb!!last_negotiated", NULL);
+    cb_data_advanced_put(aTHX_ ssl, "next_proto_select_cb!!last_status", NULL);
+    cb_data_advanced_put(aTHX_ ssl, "next_proto_select_cb!!last_negotiated", NULL);
 
     if (SvROK(cb_func) && (SvTYPE(SvRV(cb_func)) == SVt_PVCV)) {
         int count = -1;
@@ -901,7 +923,7 @@ int next_proto_select_cb_invoke(SSL *ssl, unsigned char **out, unsigned char *ou
         SV *tmpsv;
         dSP;
         
-        if (!next_proto_helper_protodata2AV(list, in, inlen)) return SSL_TLSEXT_ERR_ALERT_FATAL;
+        if (!next_proto_helper_protodata2AV(aTHX_ list, in, inlen)) return SSL_TLSEXT_ERR_ALERT_FATAL;
 
         ENTER;
         SAVETMPS;
@@ -920,9 +942,9 @@ int next_proto_select_cb_invoke(SSL *ssl, unsigned char **out, unsigned char *ou
         next_proto_len = strlen((const char*)next_proto_data);
         if (next_proto_len<=255) {
           /* store last_status + last_negotiated into global hash */
-          cb_data_advanced_put(ssl, "next_proto_select_cb!!last_status", newSViv(next_proto_status));
+          cb_data_advanced_put(aTHX_ ssl, "next_proto_select_cb!!last_status", newSViv(next_proto_status));
           tmpsv = newSVpv((const char*)next_proto_data, next_proto_len);
-          cb_data_advanced_put(ssl, "next_proto_select_cb!!last_negotiated", tmpsv);
+          cb_data_advanced_put(aTHX_ ssl, "next_proto_select_cb!!last_negotiated", tmpsv);
           *out = (unsigned char *)SvPVX(tmpsv);
           *outlen = next_proto_len;
         }
@@ -934,16 +956,16 @@ int next_proto_select_cb_invoke(SSL *ssl, unsigned char **out, unsigned char *ou
         return next_proto_len>255 ? SSL_TLSEXT_ERR_ALERT_FATAL : SSL_TLSEXT_ERR_OK;
     }
     else if (SvROK(cb_data) && (SvTYPE(SvRV(cb_data)) == SVt_PVAV)) {
-        next_proto_len = next_proto_helper_AV2protodata((AV*)SvRV(cb_data), NULL);
+        next_proto_len = next_proto_helper_AV2protodata(aTHX_ (AV*)SvRV(cb_data), NULL);
         Newx(next_proto_data, next_proto_len, unsigned char);
         if (!next_proto_data) return SSL_TLSEXT_ERR_ALERT_FATAL;
-        next_proto_len = next_proto_helper_AV2protodata((AV*)SvRV(cb_data), next_proto_data);
+        next_proto_len = next_proto_helper_AV2protodata(aTHX_ (AV*)SvRV(cb_data), next_proto_data);
 
         next_proto_status = SSL_select_next_proto(out, outlen, in, inlen, next_proto_data, next_proto_len);
 
         /* store last_status + last_negotiated into global hash */
-        cb_data_advanced_put(ssl, "next_proto_select_cb!!last_status", newSViv(next_proto_status));
-        cb_data_advanced_put(ssl, "next_proto_select_cb!!last_negotiated", newSVpv((const char*)*out, *outlen));
+        cb_data_advanced_put(aTHX_ ssl, "next_proto_select_cb!!last_status", newSViv(next_proto_status));
+        cb_data_advanced_put(aTHX_ ssl, "next_proto_select_cb!!last_negotiated", newSVpv((const char*)*out, *outlen));
         Safefree(next_proto_data);
         return SSL_TLSEXT_ERR_OK;
     }
@@ -952,6 +974,7 @@ int next_proto_select_cb_invoke(SSL *ssl, unsigned char **out, unsigned char *ou
 
 int next_protos_advertised_cb_invoke(SSL *ssl, const unsigned char **out, unsigned int *outlen, void *arg_unused)
 {
+    dTHX;
     SV *cb_func, *cb_data;
     unsigned char *protodata = NULL;
     unsigned short protodata_len = 0;
@@ -960,8 +983,8 @@ int next_protos_advertised_cb_invoke(SSL *ssl, const unsigned char **out, unsign
     SSL_CTX *ctx = SSL_get_SSL_CTX(ssl);
 
     PR1("STARTED: next_protos_advertised_cb_invoke");
-    cb_func = cb_data_advanced_get(ctx, "next_protos_advertised_cb!!func");
-    cb_data = cb_data_advanced_get(ctx, "next_protos_advertised_cb!!data");
+    cb_func = cb_data_advanced_get(aTHX_ ctx, "next_protos_advertised_cb!!func");
+    cb_data = cb_data_advanced_get(aTHX_ ctx, "next_protos_advertised_cb!!data");
 
     if (SvROK(cb_func) && (SvTYPE(SvRV(cb_func)) == SVt_PVCV)) {
         int count = -1;
@@ -979,9 +1002,9 @@ int next_protos_advertised_cb_invoke(SSL *ssl, const unsigned char **out, unsign
         tmpsv = POPs;
         if (SvOK(tmpsv) && SvROK(tmpsv) && (SvTYPE(SvRV(tmpsv)) == SVt_PVAV)) {
             tmpav = (AV*)SvRV(tmpsv);
-            protodata_len = next_proto_helper_AV2protodata(tmpav, NULL);
+            protodata_len = next_proto_helper_AV2protodata(aTHX_ tmpav, NULL);
             Newx(protodata, protodata_len, unsigned char);
-            if (protodata) next_proto_helper_AV2protodata(tmpav, protodata);
+            if (protodata) next_proto_helper_AV2protodata(aTHX_ tmpav, protodata);
         }
         PUTBACK;
         FREETMPS;
@@ -989,14 +1012,14 @@ int next_protos_advertised_cb_invoke(SSL *ssl, const unsigned char **out, unsign
     }
     else if (SvROK(cb_data) && (SvTYPE(SvRV(cb_data)) == SVt_PVAV)) {
         tmpav = (AV*)SvRV(cb_data);
-        protodata_len = next_proto_helper_AV2protodata(tmpav, NULL);
+        protodata_len = next_proto_helper_AV2protodata(aTHX_ tmpav, NULL);
         Newx(protodata, protodata_len, unsigned char);
-        if (protodata) next_proto_helper_AV2protodata(tmpav, protodata);
+        if (protodata) next_proto_helper_AV2protodata(aTHX_ tmpav, protodata);
     }    
     if (protodata) {
         tmpsv = newSVpv((const char*)protodata, protodata_len);
         Safefree(protodata);
-        cb_data_advanced_put(ssl, "next_protos_advertised_cb!!last_advertised", tmpsv);
+        cb_data_advanced_put(aTHX_ ssl, "next_protos_advertised_cb!!last_advertised", tmpsv);
         *out = (unsigned char *)SvPVX(tmpsv);
         *outlen = protodata_len;
         return SSL_TLSEXT_ERR_OK;
@@ -1015,10 +1038,11 @@ int alpn_select_cb_invoke(SSL *ssl, const unsigned char **out, unsigned char *ou
     unsigned char *alpn_data;
     size_t alpn_len;
     SSL_CTX *ctx = SSL_get_SSL_CTX(ssl);
+    dTHX;
 
     PR1("STARTED: alpn_select_cb_invoke\n");
-    cb_func = cb_data_advanced_get(ctx, "alpn_select_cb!!func");
-    cb_data = cb_data_advanced_get(ctx, "alpn_select_cb!!data");
+    cb_func = cb_data_advanced_get(aTHX_ ctx, "alpn_select_cb!!func");
+    cb_data = cb_data_advanced_get(aTHX_ ctx, "alpn_select_cb!!data");
 
     if (SvROK(cb_func) && (SvTYPE(SvRV(cb_func)) == SVt_PVCV)) {
         int count = -1;
@@ -1027,7 +1051,7 @@ int alpn_select_cb_invoke(SSL *ssl, const unsigned char **out, unsigned char *ou
         SV *alpn_data_sv;
         dSP;
 
-        if (!next_proto_helper_protodata2AV(list, in, inlen)) return SSL_TLSEXT_ERR_ALERT_FATAL;
+        if (!next_proto_helper_protodata2AV(aTHX_ list, in, inlen)) return SSL_TLSEXT_ERR_ALERT_FATAL;
 
         ENTER;
         SAVETMPS;
@@ -1063,10 +1087,10 @@ int alpn_select_cb_invoke(SSL *ssl, const unsigned char **out, unsigned char *ou
     else if (SvROK(cb_data) && (SvTYPE(SvRV(cb_data)) == SVt_PVAV)) {
         int status;
 
-        alpn_len = next_proto_helper_AV2protodata((AV*)SvRV(cb_data), NULL);
+        alpn_len = next_proto_helper_AV2protodata(aTHX_ (AV*)SvRV(cb_data), NULL);
         Newx(alpn_data, alpn_len, unsigned char);
         if (!alpn_data) return SSL_TLSEXT_ERR_ALERT_FATAL;
-        alpn_len = next_proto_helper_AV2protodata((AV*)SvRV(cb_data), alpn_data);
+        alpn_len = next_proto_helper_AV2protodata(aTHX_ (AV*)SvRV(cb_data), alpn_data);
 
         /* This is the same function that is used for NPN. */
         status = SSL_select_next_proto((unsigned char **)out, outlen, in, inlen, alpn_data, alpn_len);
@@ -1079,11 +1103,12 @@ int alpn_select_cb_invoke(SSL *ssl, const unsigned char **out, unsigned char *ou
 #endif
 
 int pem_password_cb_invoke(char *buf, int bufsize, int rwflag, void *data) {
+    simple_cb_data_t* cb = (simple_cb_data_t*)data;
+    dSSLTHX;
     dSP;
     char *str;
     int count = -1;
     size_t str_len = 0;
-    simple_cb_data_t* cb = (simple_cb_data_t*)data;
     /* this n_a is required for building with old perls: */
     STRLEN n_a;
 
@@ -1129,9 +1154,10 @@ int pem_password_cb_invoke(char *buf, int bufsize, int rwflag, void *data) {
 
 void ssleay_RSA_generate_key_cb_invoke(int i, int n, void* data)
 {
+    simple_cb_data_t* cb = (simple_cb_data_t*)data;
+    dSSLTHX;
     dSP;
     int count = -1;
-    simple_cb_data_t* cb = (simple_cb_data_t*)data;
 
     /* PR1("STARTED: ssleay_RSA_generate_key_cb_invoke\n"); / * too noisy */
     if (cb->func && SvOK(cb->func)) {
@@ -1160,11 +1186,12 @@ void ssleay_RSA_generate_key_cb_invoke(int i, int n, void* data)
 
 void ssleay_info_cb_invoke(const SSL *ssl, int where, int ret)
 {
+    dTHX;
     dSP;
     SV *cb_func, *cb_data;
 
-    cb_func = cb_data_advanced_get((void*)ssl, "ssleay_info_cb!!func");
-    cb_data = cb_data_advanced_get((void*)ssl, "ssleay_info_cb!!data");
+    cb_func = cb_data_advanced_get(aTHX_ (void*)ssl, "ssleay_info_cb!!func");
+    cb_data = cb_data_advanced_get(aTHX_ (void*)ssl, "ssleay_info_cb!!data");
 
     if ( ! SvROK(cb_func) || (SvTYPE(SvRV(cb_func)) != SVt_PVCV))
 	croak ("Net::SSLeay: ssleay_info_cb_invoke called, but not set to point to any perl function.\n");
@@ -1189,12 +1216,13 @@ void ssleay_info_cb_invoke(const SSL *ssl, int where, int ret)
 
 void ssleay_ctx_info_cb_invoke(const SSL *ssl, int where, int ret)
 {
+    dTHX;
     dSP;
     SV *cb_func, *cb_data;
     SSL_CTX *ctx = SSL_get_SSL_CTX(ssl);
 
-    cb_func = cb_data_advanced_get(ctx, "ssleay_ctx_info_cb!!func");
-    cb_data = cb_data_advanced_get(ctx, "ssleay_ctx_info_cb!!data");
+    cb_func = cb_data_advanced_get(aTHX_ ctx, "ssleay_ctx_info_cb!!func");
+    cb_data = cb_data_advanced_get(aTHX_ ctx, "ssleay_ctx_info_cb!!data");
 
     if ( ! SvROK(cb_func) || (SvTYPE(SvRV(cb_func)) != SVt_PVCV))
 	croak ("Net::SSLeay: ssleay_ctx_info_cb_invoke called, but not set to point to any perl function.\n");
@@ -1290,6 +1318,7 @@ time_t ASN1_TIME_timet(ASN1_TIME *asn1t) {
 }
 
 X509 * find_issuer(X509 *cert,X509_STORE *store, STACK_OF(X509) *chain) {
+    dTHX;
     int i;
     X509 *issuer = NULL;
 
@@ -1297,7 +1326,7 @@ X509 * find_issuer(X509 *cert,X509_STORE *store, STACK_OF(X509) *chain) {
     if (chain) {
 	for(i=0;i<sk_X509_num(chain);i++) {
 	    if ( X509_check_issued(sk_X509_value(chain,i),cert) == X509_V_OK ) {
-		TRACE(2,"found issuer in chain");
+		TRACE(aTHX_ 2,"found issuer in chain");
 		issuer = sk_X509_value(chain,i);
 	    }
 	}
@@ -1310,14 +1339,14 @@ X509 * find_issuer(X509 *cert,X509_STORE *store, STACK_OF(X509) *chain) {
 	    if (ok<0) {
 		int err = ERR_get_error();
 		if(err) {
-		    TRACE(2,"failed to get issuer: %s",ERR_error_string(err,NULL));
+		    TRACE(aTHX_ 2,"failed to get issuer: %s",ERR_error_string(err,NULL));
 		} else {
-		    TRACE(2,"failed to get issuer: unknown error");
+		    TRACE(aTHX_ 2,"failed to get issuer: unknown error");
 		}
 	    } else if (ok == 0 ) {
-		TRACE(2,"failed to get issuer(0)");
+		TRACE(aTHX_ 2,"failed to get issuer(0)");
 	    } else {
-		TRACE(2,"got issuer");
+		TRACE(aTHX_ 2,"got issuer");
 	    }
 	}
 	if (stx) X509_STORE_CTX_free(stx);
@@ -1348,7 +1377,7 @@ BOOT:
 #endif
     /* initialize global shared callback data hash */
     MY_CXT.global_cb_data = newHV();
-    MY_CXT.tid = get_my_thread_id();
+    MY_CXT.tid = get_my_thread_id(aTHX);
     PR3("BOOT: tid=%d my_perl=0x%p\n", MY_CXT.tid, my_perl);
     }
 
@@ -1362,7 +1391,7 @@ CODE:
      * somehow shared between threads
      */
     MY_CXT.global_cb_data = newHV();
-    MY_CXT.tid = get_my_thread_id();
+    MY_CXT.tid = get_my_thread_id(aTHX);
     PR3("CLONE: tid=%d my_perl=0x%p\n", MY_CXT.tid, my_perl);
 
 double
@@ -1474,7 +1503,7 @@ void
 SSL_CTX_free(ctx)
         SSL_CTX * ctx
      CODE:
-        cb_data_advanced_drop(ctx); /* clean callback related data from global hash */
+        cb_data_advanced_drop(aTHX_ ctx); /* clean callback related data from global hash */
         SSL_CTX_free(ctx);
 
 int
@@ -1525,9 +1554,9 @@ SSL_CTX_set_verify(ctx,mode,callback=&PL_sv_undef)
 
     if (callback==NULL || !SvOK(callback) || !SvTRUE(callback)) {
         SSL_CTX_set_verify(ctx, mode, NULL);
-        cb_data_advanced_put(ctx, "ssleay_verify_callback!!func", NULL);
+        cb_data_advanced_put(aTHX_ ctx, "ssleay_verify_callback!!func", NULL);
     } else {
-        cb_data_advanced_put(ctx, "ssleay_verify_callback!!func", newSVsv(callback));
+        cb_data_advanced_put(aTHX_ ctx, "ssleay_verify_callback!!func", newSVsv(callback));
         SSL_CTX_set_verify(ctx, mode, &ssleay_verify_callback_invoke);
     }
 
@@ -1546,7 +1575,7 @@ void
 SSL_free(s)
         SSL * s
      CODE:
-        cb_data_advanced_drop(s); /* clean callback related data from global hash */
+        cb_data_advanced_drop(aTHX_ s); /* clean callback related data from global hash */
         SSL_free(s);
 
 #if 0 /* this seems to be gone in 0.9.0 */
@@ -1902,10 +1931,10 @@ SSL_set_verify(s,mode,callback)
     CODE:
         if (callback==NULL || !SvOK(callback)) {
             SSL_set_verify(s, mode, NULL);
-            cb_data_advanced_put(s, "ssleay_verify_callback!!func", NULL);
+            cb_data_advanced_put(aTHX_ s, "ssleay_verify_callback!!func", NULL);
         }
         else {
-            cb_data_advanced_put(s, "ssleay_verify_callback!!func", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ s, "ssleay_verify_callback!!func", newSVsv(callback));
             SSL_set_verify(s, mode, &ssleay_verify_callback_invoke);
         }
 
@@ -2129,11 +2158,11 @@ SSL_CTX_set_tlsext_servername_callback(ctx,callback=&PL_sv_undef,data=&PL_sv_und
     if (callback==NULL || !SvOK(callback)) {
         SSL_CTX_set_tlsext_servername_callback(ctx, NULL);
         SSL_CTX_set_tlsext_servername_arg(ctx, NULL);
-        cb_data_advanced_put(ctx, "tlsext_servername_callback!!data", NULL);
-        cb_data_advanced_put(ctx, "tlsext_servername_callback!!func", NULL);
+        cb_data_advanced_put(aTHX_ ctx, "tlsext_servername_callback!!data", NULL);
+        cb_data_advanced_put(aTHX_ ctx, "tlsext_servername_callback!!func", NULL);
     } else {
-        cb_data_advanced_put(ctx, "tlsext_servername_callback!!data", newSVsv(data));
-        cb_data_advanced_put(ctx, "tlsext_servername_callback!!func", newSVsv(callback));
+        cb_data_advanced_put(aTHX_ ctx, "tlsext_servername_callback!!data", newSVsv(data));
+        cb_data_advanced_put(aTHX_ ctx, "tlsext_servername_callback!!func", newSVsv(callback));
         SSL_CTX_set_tlsext_servername_callback(ctx, &tlsext_servername_callback_invoke);
         SSL_CTX_set_tlsext_servername_arg(ctx, (void*)ctx);
     }
@@ -4021,12 +4050,12 @@ SSL_CTX_set_cert_verify_callback(ctx,callback,data=&PL_sv_undef)
     CODE: 
         if (callback==NULL || !SvOK(callback)) {
             SSL_CTX_set_cert_verify_callback(ctx, NULL, NULL);
-            cb_data_advanced_put(ctx, "ssleay_ctx_cert_verify_cb!!func", NULL);
-            cb_data_advanced_put(ctx, "ssleay_ctx_cert_verify_cb!!data", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_cert_verify_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_cert_verify_cb!!data", NULL);
         }
         else {
-            cb_data_advanced_put(ctx, "ssleay_ctx_cert_verify_cb!!func", newSVsv(callback));
-            cb_data_advanced_put(ctx, "ssleay_ctx_cert_verify_cb!!data", newSVsv(data));
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_cert_verify_cb!!func", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_cert_verify_cb!!data", newSVsv(data));
 #if OPENSSL_VERSION_NUMBER >= 0x0090700fL
             SSL_CTX_set_cert_verify_callback(ctx, ssleay_ctx_cert_verify_cb_invoke, ctx);
 #else
@@ -4051,10 +4080,10 @@ SSL_CTX_set_default_passwd_cb(ctx,callback=&PL_sv_undef)
         if (callback==NULL || !SvOK(callback)) {
             SSL_CTX_set_default_passwd_cb(ctx, NULL);
             SSL_CTX_set_default_passwd_cb_userdata(ctx, NULL);
-            cb_data_advanced_put(ctx, "ssleay_ctx_passwd_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_passwd_cb!!func", NULL);
         }
         else {
-            cb_data_advanced_put(ctx, "ssleay_ctx_passwd_cb!!func", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_passwd_cb!!func", newSVsv(callback));
             SSL_CTX_set_default_passwd_cb_userdata(ctx, (void*)ctx);
             SSL_CTX_set_default_passwd_cb(ctx, &ssleay_ctx_passwd_cb_invoke);
         }
@@ -4066,10 +4095,10 @@ SSL_CTX_set_default_passwd_cb_userdata(ctx,data=&PL_sv_undef)
     CODE:
         /* SSL_CTX_set_default_passwd_cb_userdata is set in SSL_CTX_set_default_passwd_cb */
         if (data==NULL || !SvOK(data)) {
-            cb_data_advanced_put(ctx, "ssleay_ctx_passwd_cb!!data", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_passwd_cb!!data", NULL);
         }
         else {
-            cb_data_advanced_put(ctx, "ssleay_ctx_passwd_cb!!data", newSVsv(data));
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_passwd_cb!!data", newSVsv(data));
         }
 
 int
@@ -4284,11 +4313,11 @@ SSL_set_info_callback(ssl,callback,data=&PL_sv_undef)
     CODE: 
         if (callback==NULL || !SvOK(callback)) {
             SSL_set_info_callback(ssl, NULL);
-            cb_data_advanced_put(ssl, "ssleay_info_cb!!func", NULL);
-            cb_data_advanced_put(ssl, "ssleay_info_cb!!data", NULL);
+            cb_data_advanced_put(aTHX_ ssl, "ssleay_info_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ssl, "ssleay_info_cb!!data", NULL);
         } else {
-            cb_data_advanced_put(ssl, "ssleay_info_cb!!func", newSVsv(callback));
-            cb_data_advanced_put(ssl, "ssleay_info_cb!!data", newSVsv(data));
+            cb_data_advanced_put(aTHX_ ssl, "ssleay_info_cb!!func", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ssl, "ssleay_info_cb!!data", newSVsv(data));
             SSL_set_info_callback(ssl, ssleay_info_cb_invoke);
         }
 
@@ -4300,11 +4329,11 @@ SSL_CTX_set_info_callback(ctx,callback,data=&PL_sv_undef)
     CODE: 
         if (callback==NULL || !SvOK(callback)) {
             SSL_CTX_set_info_callback(ctx, NULL);
-            cb_data_advanced_put(ctx, "ssleay_ctx_info_cb!!func", NULL);
-            cb_data_advanced_put(ctx, "ssleay_ctx_info_cb!!data", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_info_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_info_cb!!data", NULL);
         } else {
-            cb_data_advanced_put(ctx, "ssleay_ctx_info_cb!!func", newSVsv(callback));
-            cb_data_advanced_put(ctx, "ssleay_ctx_info_cb!!data", newSVsv(data));
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_info_cb!!func", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ctx, "ssleay_ctx_info_cb!!data", newSVsv(data));
             SSL_CTX_set_info_callback(ctx, ssleay_ctx_info_cb_invoke);
         }
 
@@ -4693,7 +4722,7 @@ RSA_generate_key(bits,ee,perl_cb=&PL_sv_undef,perl_data=&PL_sv_undef)
        BIGNUM *e;
        e = BN_new();
        BN_set_word(e, ee);
-       cb_data = simple_cb_data_new(perl_cb, perl_data);
+       cb_data = simple_cb_data_new(aTHX_ perl_cb, perl_data);
        BN_GENCB new_cb;
        BN_GENCB_set_old(&new_cb, ssleay_RSA_generate_key_cb_invoke, cb_data);
 
@@ -4702,7 +4731,7 @@ RSA_generate_key(bits,ee,perl_cb=&PL_sv_undef,perl_data=&PL_sv_undef)
        
        if (rc == -1 || ret == NULL)
            croak("Couldn't generate RSA key");
-       simple_cb_data_free(cb_data);
+       simple_cb_data_free(aTHX_ cb_data);
        BN_free(e);
        e = NULL;
        RETVAL = ret;
@@ -4720,9 +4749,9 @@ RSA_generate_key(bits,e,perl_cb=&PL_sv_undef,perl_data=&PL_sv_undef)
     PREINIT:
         simple_cb_data_t* cb = NULL;
     CODE:
-        cb = simple_cb_data_new(perl_cb, perl_data);
+        cb = simple_cb_data_new(aTHX_ perl_cb, perl_data);
         RETVAL = RSA_generate_key(bits, e, ssleay_RSA_generate_key_cb_invoke, cb);
-        simple_cb_data_free(cb);
+        simple_cb_data_free(aTHX_ cb);
     OUTPUT:
         RETVAL
 
@@ -4779,9 +4808,9 @@ PEM_read_bio_PrivateKey(bio,perl_cb=&PL_sv_undef,perl_data=&PL_sv_undef)
         RETVAL = 0;
         if (SvOK(perl_cb)) {
             /* setup our callback */
-            cb = simple_cb_data_new(perl_cb, perl_data);
+            cb = simple_cb_data_new(aTHX_ perl_cb, perl_data);
             RETVAL = PEM_read_bio_PrivateKey(bio, NULL, pem_password_cb_invoke, (void*)cb);
-            simple_cb_data_free(cb);
+            simple_cb_data_free(aTHX_ cb);
         }
         else if (!SvOK(perl_cb) && SvOK(perl_data) && SvPOK(perl_data)) {
             /* use perl_data as the password */
@@ -4895,12 +4924,12 @@ SSL_set_session_secret_cb(s,callback=&PL_sv_undef,data=&PL_sv_undef)
     CODE:
         if (callback==NULL || !SvOK(callback)) {
             SSL_set_session_secret_cb(s, NULL, NULL);
-            cb_data_advanced_put(s, "ssleay_session_secret_cb!!func", NULL);
-            cb_data_advanced_put(s, "ssleay_session_secret_cb!!data", NULL);
+            cb_data_advanced_put(aTHX_ s, "ssleay_session_secret_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ s, "ssleay_session_secret_cb!!data", NULL);
         }
         else {
-            cb_data_advanced_put(s, "ssleay_session_secret_cb!!func", newSVsv(callback));
-            cb_data_advanced_put(s, "ssleay_session_secret_cb!!data", newSVsv(data));
+            cb_data_advanced_put(aTHX_ s, "ssleay_session_secret_cb!!func", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ s, "ssleay_session_secret_cb!!data", newSVsv(data));
             SSL_set_session_secret_cb(s, (int (*)(SSL *s, void *secret, int *secret_len,
                 STACK_OF(SSL_CIPHER) *peer_ciphers,
                 SSL_CIPHER **cipher, void *arg))&ssleay_session_secret_cb_invoke, s);
@@ -5350,20 +5379,20 @@ SSL_CTX_set_next_protos_advertised_cb(ctx,callback,data=&PL_sv_undef)
         RETVAL = 1;
         if (callback==NULL || !SvOK(callback)) {
             SSL_CTX_set_next_protos_advertised_cb(ctx, NULL, NULL);
-            cb_data_advanced_put(ctx, "next_protos_advertised_cb!!func", NULL);
-            cb_data_advanced_put(ctx, "next_protos_advertised_cb!!data", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "next_protos_advertised_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "next_protos_advertised_cb!!data", NULL);
             PR1("SSL_CTX_set_next_protos_advertised_cb - undef\n");
         }
         else if (SvROK(callback) && (SvTYPE(SvRV(callback)) == SVt_PVAV)) {
             /* callback param array ref like ['proto1','proto2'] */
-            cb_data_advanced_put(ctx, "next_protos_advertised_cb!!func", NULL);
-            cb_data_advanced_put(ctx, "next_protos_advertised_cb!!data", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ctx, "next_protos_advertised_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "next_protos_advertised_cb!!data", newSVsv(callback));
             SSL_CTX_set_next_protos_advertised_cb(ctx, next_protos_advertised_cb_invoke, ctx);
             PR2("SSL_CTX_set_next_protos_advertised_cb - simple ctx=%p\n",ctx);
         }
         else if (SvROK(callback) && (SvTYPE(SvRV(callback)) == SVt_PVCV)) {
-            cb_data_advanced_put(ctx, "next_protos_advertised_cb!!func", newSVsv(callback));
-            cb_data_advanced_put(ctx, "next_protos_advertised_cb!!data", newSVsv(data));
+            cb_data_advanced_put(aTHX_ ctx, "next_protos_advertised_cb!!func", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ctx, "next_protos_advertised_cb!!data", newSVsv(data));
             SSL_CTX_set_next_protos_advertised_cb(ctx, next_protos_advertised_cb_invoke, ctx);
             PR2("SSL_CTX_set_next_protos_advertised_cb - advanced ctx=%p\n",ctx);
         }
@@ -5382,20 +5411,20 @@ SSL_CTX_set_next_proto_select_cb(ctx,callback,data=&PL_sv_undef)
         RETVAL = 1;
         if (callback==NULL || !SvOK(callback)) {
             SSL_CTX_set_next_proto_select_cb(ctx, NULL, NULL);
-            cb_data_advanced_put(ctx, "next_proto_select_cb!!func", NULL);
-            cb_data_advanced_put(ctx, "next_proto_select_cb!!data", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "next_proto_select_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "next_proto_select_cb!!data", NULL);
             PR1("SSL_CTX_set_next_proto_select_cb - undef\n");
         }
         else if (SvROK(callback) && (SvTYPE(SvRV(callback)) == SVt_PVAV)) {
             /* callback param array ref like ['proto1','proto2'] */
-            cb_data_advanced_put(ctx, "next_proto_select_cb!!func", NULL);
-            cb_data_advanced_put(ctx, "next_proto_select_cb!!data", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ctx, "next_proto_select_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "next_proto_select_cb!!data", newSVsv(callback));
             SSL_CTX_set_next_proto_select_cb(ctx, next_proto_select_cb_invoke, ctx);
             PR2("SSL_CTX_set_next_proto_select_cb - simple ctx=%p\n",ctx);
         }
         else if (SvROK(callback) && (SvTYPE(SvRV(callback)) == SVt_PVCV)) {
-            cb_data_advanced_put(ctx, "next_proto_select_cb!!func", newSVsv(callback));
-            cb_data_advanced_put(ctx, "next_proto_select_cb!!data", newSVsv(data));
+            cb_data_advanced_put(aTHX_ ctx, "next_proto_select_cb!!func", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ctx, "next_proto_select_cb!!data", newSVsv(data));
             SSL_CTX_set_next_proto_select_cb(ctx, next_proto_select_cb_invoke, ctx);
             PR2("SSL_CTX_set_next_proto_select_cb - advanced ctx=%p\n",ctx);
         }
@@ -5419,7 +5448,7 @@ void
 P_next_proto_last_status(s)
         const SSL *s
     PPCODE:
-        XPUSHs(sv_2mortal(newSVsv(cb_data_advanced_get((void*)s, "next_proto_select_cb!!last_status"))));
+        XPUSHs(sv_2mortal(newSVsv(cb_data_advanced_get(aTHX_ (void*)s, "next_proto_select_cb!!last_status"))));
 
 #endif
 
@@ -5439,11 +5468,11 @@ SSL_CTX_set_tlsext_status_cb(ctx,callback,data=&PL_sv_undef)
 	RETVAL = 1;
 	if (callback==NULL || !SvOK(callback)) {
 	    SSL_CTX_set_tlsext_status_cb(ctx, NULL);
-	    cb_data_advanced_put(ctx, "tlsext_status_cb!!func", NULL);
-	    cb_data_advanced_put(ctx, "tlsext_status_cb!!data", NULL);
+	    cb_data_advanced_put(aTHX_ ctx, "tlsext_status_cb!!func", NULL);
+	    cb_data_advanced_put(aTHX_ ctx, "tlsext_status_cb!!data", NULL);
 	} else if (SvROK(callback) && (SvTYPE(SvRV(callback)) == SVt_PVCV)) {
-	    cb_data_advanced_put(ctx, "tlsext_status_cb!!func", newSVsv(callback));
-	    cb_data_advanced_put(ctx, "tlsext_status_cb!!data", newSVsv(data));
+	    cb_data_advanced_put(aTHX_ ctx, "tlsext_status_cb!!func", newSVsv(callback));
+	    cb_data_advanced_put(aTHX_ ctx, "tlsext_status_cb!!data", newSVsv(data));
 	    SSL_CTX_set_tlsext_status_cb(ctx, tlsext_status_cb_invoke);
 	} else {
 	    croak("argument must be code reference");
@@ -5618,7 +5647,7 @@ SSL_OCSP_response_verify(ssl,rsp,svreq=NULL,flags=0)
 	    i = OCSP_check_nonce(req,bsr);
 	    if ( i <= 0 ) {
 		if (i == -1) {
-		    TRACE(2,"SSL_OCSP_response_verify: no nonce in response");
+		    TRACE(aTHX_ 2,"SSL_OCSP_response_verify: no nonce in response");
 		} else {
 		    OCSP_BASICRESP_free(bsr);
 		    croak("nonce in OCSP response does not match request");
@@ -5636,7 +5665,7 @@ SSL_OCSP_response_verify(ssl,rsp,svreq=NULL,flags=0)
 		if (!bsr->certs) bsr->certs = sk_X509_new_null();
 		sk_X509_push(bsr->certs,X509_dup(sk_X509_value(chain,i)));
 	    }
-	    TRACE(1,"run basic verify");
+	    TRACE(aTHX_ 1,"run basic verify");
 	    RETVAL = OCSP_basic_verify(bsr, NULL, store, flags);
 	    if (!RETVAL) {
 		/* some CAs don't add a certificate to their OCSP responses and
@@ -5647,7 +5676,7 @@ SSL_OCSP_response_verify(ssl,rsp,svreq=NULL,flags=0)
 		X509 *last = sk_X509_value(chain,sk_X509_num(chain)-1);
 		if ( (issuer = find_issuer(last,store,chain))) {
 		    sk_X509_push(bsr->certs,X509_dup(issuer));
-		    TRACE(1,"run OCSP_basic_verify with issuer for last chain element");
+		    TRACE(aTHX_ 1,"run OCSP_basic_verify with issuer for last chain element");
 		    RETVAL = OCSP_basic_verify(bsr, NULL, store, flags);
 		}
 	    }
@@ -5784,20 +5813,20 @@ SSL_CTX_set_alpn_select_cb(ctx,callback,data=&PL_sv_undef)
         RETVAL = 1;
         if (callback==NULL || !SvOK(callback)) {
             SSL_CTX_set_alpn_select_cb(ctx, NULL, NULL);
-            cb_data_advanced_put(ctx, "alpn_select_cb!!func", NULL);
-            cb_data_advanced_put(ctx, "alpn_select_cb!!data", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "alpn_select_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "alpn_select_cb!!data", NULL);
             PR1("SSL_CTX_set_alpn_select_cb - undef\n");
         }
         else if (SvROK(callback) && (SvTYPE(SvRV(callback)) == SVt_PVAV)) {
             /* callback param array ref like ['proto1','proto2'] */
-            cb_data_advanced_put(ctx, "alpn_select_cb!!func", NULL);
-            cb_data_advanced_put(ctx, "alpn_select_cb!!data", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ctx, "alpn_select_cb!!func", NULL);
+            cb_data_advanced_put(aTHX_ ctx, "alpn_select_cb!!data", newSVsv(callback));
             SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb_invoke, ctx);
             PR2("SSL_CTX_set_alpn_select_cb - simple ctx=%p\n",ctx);
         }
         else if (SvROK(callback) && (SvTYPE(SvRV(callback)) == SVt_PVCV)) {
-            cb_data_advanced_put(ctx, "alpn_select_cb!!func", newSVsv(callback));
-            cb_data_advanced_put(ctx, "alpn_select_cb!!data", newSVsv(data));
+            cb_data_advanced_put(aTHX_ ctx, "alpn_select_cb!!func", newSVsv(callback));
+            cb_data_advanced_put(aTHX_ ctx, "alpn_select_cb!!data", newSVsv(data));
             SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb_invoke, ctx);
             PR2("SSL_CTX_set_alpn_select_cb - advanced ctx=%p\n",ctx);
         }
@@ -5811,19 +5840,19 @@ int
 SSL_CTX_set_alpn_protos(ctx,data=&PL_sv_undef)
         SSL_CTX * ctx
         SV * data
-    CODE:
+    PREINIT:
         unsigned char *alpn_data;
         unsigned char alpn_len;
-
+    CODE:
         RETVAL = -1;
 
         if (!SvROK(data) || (SvTYPE(SvRV(data)) != SVt_PVAV))
             croak("Net::SSLeay: CTX_set_alpn_protos needs a single array reference.\n");
-        alpn_len = next_proto_helper_AV2protodata((AV*)SvRV(data), NULL);
+        alpn_len = next_proto_helper_AV2protodata(aTHX_ (AV*)SvRV(data), NULL);
         Newx(alpn_data, alpn_len, unsigned char);
         if (!alpn_data)
             croak("Net::SSLeay: CTX_set_alpn_protos could not allocate memory.\n");
-        alpn_len = next_proto_helper_AV2protodata((AV*)SvRV(data), alpn_data);
+        alpn_len = next_proto_helper_AV2protodata(aTHX_ (AV*)SvRV(data), alpn_data);
         RETVAL = SSL_CTX_set_alpn_protos(ctx, alpn_data, alpn_len);
         Safefree(alpn_data);
 
@@ -5834,19 +5863,19 @@ int
 SSL_set_alpn_protos(ssl,data=&PL_sv_undef)
         SSL * ssl
         SV * data
-    CODE:
+    PREINIT:
         unsigned char *alpn_data;
         unsigned char alpn_len;
-
+    CODE:
         RETVAL = -1;
 
         if (!SvROK(data) || (SvTYPE(SvRV(data)) != SVt_PVAV))
             croak("Net::SSLeay: set_alpn_protos needs a single array reference.\n");
-        alpn_len = next_proto_helper_AV2protodata((AV*)SvRV(data), NULL);
+        alpn_len = next_proto_helper_AV2protodata(aTHX_ (AV*)SvRV(data), NULL);
         Newx(alpn_data, alpn_len, unsigned char);
         if (!alpn_data)
             croak("Net::SSLeay: set_alpn_protos could not allocate memory.\n");
-        alpn_len = next_proto_helper_AV2protodata((AV*)SvRV(data), alpn_data);
+        alpn_len = next_proto_helper_AV2protodata(aTHX_ (AV*)SvRV(data), alpn_data);
         RETVAL = SSL_set_alpn_protos(ssl, alpn_data, alpn_len);
         Safefree(alpn_data);
 
