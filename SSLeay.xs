@@ -193,6 +193,194 @@ which conflicts with perls
 #endif
 #undef BLOCK
 
+#ifdef WIN32
+#include "applink.c"
+
+    typedef enum _PROCESSINFOCLASS {
+        ProcessBasicInformation = 0,
+        ProcessWow64Information = 26
+    } PROCESSINFOCLASS;
+    typedef LONG KPRIORITY;
+    typedef struct _PEB_LDR_DATA {
+        ULONG          Length;
+        BOOLEAN        Initialized;
+        HANDLE         SsHandle;
+        LIST_ENTRY     LoadOrder;
+        LIST_ENTRY     MemoryOrder;
+        LIST_ENTRY     InitializationOrder;
+    } PEB_LDR_DATA, *PPEB_LDR_DATA;
+    typedef struct _PEB_FREE_BLOCK {
+        struct _PEB_FREE_BLOCK *Next;
+        ULONG Size;
+    } PEB_FREE_BLOCK, *PPEB_FREE_BLOCK;
+#define GDI_HANDLE_BUFFER_SIZE      34
+    typedef struct _PEB {
+        BOOLEAN InheritedAddressSpace;      // These four fields cannot change unless the
+        BOOLEAN ReadImageFileExecOptions;   //
+        BOOLEAN BeingDebugged;              //
+        BOOLEAN SpareBool;                  //
+        HANDLE Mutant;                      // INITIAL_PEB structure is also updated.
+        
+        PVOID ImageBaseAddress;
+        PPEB_LDR_DATA Ldr;
+        struct _RTL_USER_PROCESS_PARAMETERS *ProcessParameters;
+        PVOID SubSystemData;
+        PVOID ProcessHeap;
+        PVOID FastPebLock;
+        PVOID FastPebLockRoutine;
+        PVOID FastPebUnlockRoutine;
+        ULONG EnvironmentUpdateCount;
+        PVOID KernelCallbackTable;
+        HANDLE EventLogSection;
+        PVOID EventLog;
+        PPEB_FREE_BLOCK FreeList;
+        ULONG TlsExpansionCounter;
+        PVOID TlsBitmap;
+        ULONG TlsBitmapBits[2];         // relates to TLS_MINIMUM_AVAILABLE
+        PVOID ReadOnlySharedMemoryBase;
+        PVOID ReadOnlySharedMemoryHeap;
+        PVOID *ReadOnlyStaticServerData;
+        PVOID AnsiCodePageData;
+        PVOID OemCodePageData;
+        PVOID UnicodeCaseTableData;
+        
+        // Useful information for LdrpInitialize
+        ULONG NumberOfProcessors;
+        ULONG NtGlobalFlag;
+        
+        // Passed up from MmCreatePeb from Session Manager registry key
+        
+        LARGE_INTEGER CriticalSectionTimeout;
+        ULONG HeapSegmentReserve;
+        ULONG HeapSegmentCommit;
+        ULONG HeapDeCommitTotalFreeThreshold;
+        ULONG HeapDeCommitFreeBlockThreshold;
+        
+        // Where heap manager keeps track of all heaps created for a process
+        // Fields initialized by MmCreatePeb.  ProcessHeaps is initialized
+        // to point to the first free byte after the PEB and MaximumNumberOfHeaps
+        // is computed from the page size used to hold the PEB, less the fixed
+        // size of this data structure.
+        
+        ULONG NumberOfHeaps;
+        ULONG MaximumNumberOfHeaps;
+        PVOID *ProcessHeaps;
+        
+        //
+        //
+        PVOID GdiSharedHandleTable;
+        PVOID ProcessStarterHelper;
+        PVOID GdiDCAttributeList;
+        PVOID LoaderLock;
+        
+        // Following fields filled in by MmCreatePeb from system values and/or
+        // image header.
+        
+        ULONG OSMajorVersion;
+        ULONG OSMinorVersion;
+        ULONG OSBuildNumber;
+        ULONG OSPlatformId;
+        ULONG ImageSubsystem;
+        ULONG ImageSubsystemMajorVersion;
+        ULONG ImageSubsystemMinorVersion;
+        ULONG ImageProcessAffinityMask;
+        ULONG GdiHandleBuffer[GDI_HANDLE_BUFFER_SIZE];
+    } PEB, *PPEB;
+
+typedef struct _CLIENT_ID {
+  HANDLE UniqueProcess;
+  HANDLE UniqueThread;
+} CLIENT_ID, *PCLIENT_ID;
+#define WIN32_CLIENT_INFO_LENGTH   31
+#define STATIC_UNICODE_BUFFER_LENGTH   261
+typedef LONG NTSTATUS;
+#define GDI_BATCH_BUFFER_SIZE 310
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING;
+
+typedef struct _GDI_TEB_BATCH {
+    ULONG Offset;
+    ULONG HDC;
+    ULONG Buffer[GDI_BATCH_BUFFER_SIZE];
+} GDI_TEB_BATCH,*PGDI_TEB_BATCH;
+
+typedef struct _TEB {
+    NT_TIB NtTib;
+    PVOID  EnvironmentPointer;
+    CLIENT_ID ClientId;
+    PVOID ActiveRpcHandle;
+    PVOID ThreadLocalStoragePointer;
+    PPEB ProcessEnvironmentBlock;
+    ULONG LastErrorValue;
+    ULONG CountOfOwnedCriticalSections;
+    PVOID CsrClientThread;
+    PVOID Win32ThreadInfo;          // PtiCurrent
+    ULONG Win32ClientInfo[WIN32_CLIENT_INFO_LENGTH];    // User32 Client Info
+    PVOID WOW32Reserved;           // used by WOW
+    LCID CurrentLocale;
+    ULONG FpSoftwareStatusRegister;
+    PVOID SystemReserved1[54];      // Used by FP emulator
+    PVOID Spare1;                   // unused
+    NTSTATUS ExceptionCode;         // for RaiseUserException
+    UCHAR SpareBytes1[40];
+    PVOID SystemReserved2[10];                      // Used by user/console for temp obja
+    GDI_TEB_BATCH GdiTebBatch;      // Gdi batching
+    ULONG gdiRgn;
+    ULONG gdiPen;
+    ULONG gdiBrush;
+    CLIENT_ID RealClientId;
+    HANDLE GdiCachedProcessHandle;
+    ULONG GdiClientPID;
+    ULONG GdiClientTID;
+    PVOID GdiThreadLocalInfo;
+    PVOID UserReserved[5];          // unused
+    PVOID glDispatchTable[280];     // OpenGL
+    ULONG glReserved1[26];          // OpenGL
+    PVOID glReserved2;              // OpenGL
+    PVOID glSectionInfo;            // OpenGL
+    PVOID glSection;                // OpenGL
+    PVOID glTable;                  // OpenGL
+    PVOID glCurrentRC;              // OpenGL
+    PVOID glContext;                // OpenGL
+    ULONG LastStatusValue;
+    UNICODE_STRING StaticUnicodeString;
+    WCHAR StaticUnicodeBuffer[STATIC_UNICODE_BUFFER_LENGTH];
+    PVOID DeallocationStack;
+    PVOID TlsSlots[TLS_MINIMUM_AVAILABLE];
+    LIST_ENTRY TlsLinks;
+    PVOID Vdm;
+    PVOID ReservedForNtRpc;
+    PVOID DbgSsReserved[2];
+    ULONG HardErrorsAreDisabled;
+    PVOID Instrumentation[16];
+    PVOID WinSockData;              // WinSock
+    ULONG GdiBatchCount;
+    ULONG Spare2;
+    ULONG Spare3;
+    ULONG Spare4;
+    PVOID ReservedForOle;
+    ULONG WaitingOnLoaderLock;
+} TEB;
+typedef TEB *PTEB;
+
+#ifdef _MSC_VER
+#  if defined(_M_IX86)
+__forceinline PTEB NtCurrentTeb() {
+    return (PTEB) __readfsdword(0x18);
+}
+#  elif defined(_M_AMD64)
+__forceinline PTEB NtCurrentTeb() {
+    return (PTEB) __readgsqword(0x30);
+}
+#  else
+#    error unknown CPU arch
+#  endif
+#endif
+#endif /* WIN32 */
+
 /* Debugging output - to enable use:
  *
  * perl Makefile.PL DEFINE=-DSHOW_XS_DEBUG
@@ -1362,6 +1550,18 @@ PROTOTYPES: ENABLE
 
 BOOT:
     {
+#ifdef WIN32
+/*  &__ImageBase is a more efficient way to get "HINSTANCE hinstDLL" arg passed
+    to DllMain of this XS module, or using GetModuleHandleEx() with
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS (<- flag is WinXP or newer only,
+    no Win2k) */
+#  ifndef _MSC_VER
+#    define __ImageBase _image_base__
+#  endif
+    extern IMAGE_DOS_HEADER __ImageBase;
+    PPEB peb;
+    void * OrigBaseAddress;
+#endif
     MY_CXT_INIT;
     LIB_initialized = 0;
 #ifdef USE_ITHREADS
@@ -1379,6 +1579,72 @@ BOOT:
     MY_CXT.global_cb_data = newHV();
     MY_CXT.tid = get_my_thread_id(aTHX);
     PR3("BOOT: tid=%d my_perl=0x%p\n", MY_CXT.tid, my_perl);
+#ifdef WIN32
+    peb = NtCurrentTeb()->ProcessEnvironmentBlock;
+    /* make sure the data under our definition of the PEB is what we want to
+       replace, if the PEB definition is wrong, "peb->ImageBaseAddress"
+       will contain random flags, or random pointers, so then abort patching */
+    if(GetModuleHandle(NULL) != peb->ImageBaseAddress)
+        croak("BOOT: PEB struct definition is wrong");
+    OrigBaseAddress = peb->ImageBaseAddress;
+    /* do the patch */
+    peb->ImageBaseAddress = &__ImageBase;
+    /* verify that the patch had an effect, typically DLLs live at address
+       0x10000000 unless relocated or rebased, 0x10000000 looks like a flag so
+       the patch location might have been a false positive, and is actually
+       flag 0x10000000 if the PEB definition is wrong/changed in the future by
+       MS, so make sure that patch's effect shows in the public API
+       GetModuleHandle */
+    if(GetModuleHandle(NULL) != (HMODULE)&__ImageBase) {
+        croak("BOOT: PEB patching failed, patch had no effect");
+    }
+    {
+        /* do something that ultimatley calls OPENSSL_Applink to initialize
+           the function pointer now so we can immediatly undo the patch */
+        char fn [MAX_PATH+1];
+        BIO * bio;
+        int bio_flags;
+        FILE * f;
+        /* we know we the XS DLL exist on disk, by the sheer fact that you cant
+          delete a loaded in memory DLL */
+        DWORD res = GetModuleFileName((HMODULE)&__ImageBase, fn, MAX_PATH+1);
+        if (!res || res ==MAX_PATH+1)
+            croak("BOOT: GetModuleFileName failed");
+        f = fopen(fn, "r");
+        /* if BIO_new_file is used, applink wont be called, since openssl will
+           use it's CRT for the rest of the BIO's life, not SSLeay.xs's CRT */
+        bio = BIO_new(BIO_s_file());
+        bio_flags = BIO_get_flags(bio);
+#define PLSSLEAY_FLAGS_UPLINK         0x8000 /* not defined in a public header */
+        /* by default, a new BIO, has BIO_FLAGS_UPLINK flag turned on, atleast
+          for Win32 builds, setting a FILE * may or may not clear that flag.
+          Since the value of BIO_FLAGS_UPLINK may change in the future, detect
+          if it has changed and error out if the flag isn't in a fresh BIO
+          object. We must have BIO_FLAGS_UPLINK turned on to force a call
+          to OPENSSL_Applink */
+        if((bio_flags & PLSSLEAY_FLAGS_UPLINK) != PLSSLEAY_FLAGS_UPLINK)
+            croak("BOOT: this Win32 OpenSSL library isn't using BIO_FLAGS_UPLINK for new BIO objects");
+        /* BIO_set_fp winds up calling BIO_set_fp->file_ctrl, and in file_ctrl
+           in "case BIO_C_SET_FILE_PTR:", openssl does some tests to guess if
+           the FILE * is from openssl's CRT or not, if it guesses it is from
+           openssl's CRT, it then turns off BIO_FLAGS_UPLINK flag, but not all
+           UP_* calls do this guessing, like "case BIO_CTRL_FLUSH:", so for
+           saftey force BIO_FLAGS_UPLINK back on, it may or may not already
+           have been there based on the CRT versions and guessing of origin of
+           the FILE *, this guarentees that an UP_* will be called in BIO_free
+        */
+
+        BIO_set_fp(bio, f, BIO_CLOSE);
+        BIO_set_flags(bio, PLSSLEAY_FLAGS_UPLINK);
+        /* OPENSSL_Applink gets called from inside BIO_free */
+        BIO_free(bio);
+    }
+    /* undo the patch, the static vars inside are now set, if this isn't done
+       VC C debugger and VMMap will both claim SSLeay.dll is "the process" AKA
+       "the .exe that started the process" which is very confusing to someone
+       who is using these diagnostic tools */
+    peb->ImageBaseAddress = OrigBaseAddress;
+#endif
     }
 
 void

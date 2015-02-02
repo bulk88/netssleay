@@ -46,4 +46,6 @@ SSLeay$Config{'obj_ext'} : constants.c $constants_t
 
 MAKE
 
+makemaker_args(FUNCLIST => ['boot_Net__SSLeay', 'OPENSSL_Applink']) if $^O eq 'MSWin32';
+
 WriteAll();
